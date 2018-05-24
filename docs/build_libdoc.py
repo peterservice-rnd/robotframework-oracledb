@@ -9,4 +9,4 @@ SRC_DIR = realpath(join(DOCS_DIR, '..', 'src'))
 LIB_NAME = 'OracleDB'
 
 if __name__ == '__main__':
-    libdoc(join(SRC_DIR, LIB_NAME + '.py'), join(DOCS_DIR, LIB_NAME + '.html'), version='1.0.0')
+    libdoc(join(SRC_DIR, LIB_NAME + '.py'), join(DOCS_DIR, LIB_NAME + '.html'), version='1.0.1')
