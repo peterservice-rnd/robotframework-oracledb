@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
+from contextlib import contextmanager
+from html import escape
+from threading import Timer
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Type, Union
+from types import TracebackType
 
+import cx_Oracle
+import sqlparse
 from robot.api import logger
+from robot.running.context import EXECUTION_CONTEXTS
+from robot.running.timeouts import KeywordTimeout, TestTimeout
 from robot.utils import ConnectionCache
-
-try:
-    import cx_Oracle
-except ImportError as info:
-    logger.warn("Import cx_Oracle Error:", info)
-if cx_Oracle.version < '3.0':
-    logger.warn("Very old version of cx_Oracle :", cx_Oracle.version)
+from robot.libraries.BuiltIn import BuiltIn
 
 
 class OracleDB(object):
@@ -16,21 +19,52 @@ class OracleDB(object):
     Robot Framework library for working with Oracle DB.
 
     == Dependencies ==
-    | cx_Oracle | http://cx-oracle.sourceforge.net | version > 3.0 |
+    | cx_Oracle | http://cx-oracle.sourceforge.net | version >= 5.3 |
     | robot framework | http://robotframework.org |
     """
 
+    DEFAULT_TIMEOUT = 900.0  # The default timeout for executing an SQL query is 15 minutes
     ROBOT_LIBRARY_SCOPE = 'GLOBAL'
-    last_executed_statement = None
-    last_executed_statement_params = None
+    last_executed_statement: Optional[str] = None
+    last_executed_statement_params: Optional[Dict[str, Any]] = None
+    last_used_connection_index: Optional[int] = None
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Library initialization.
         Robot Framework ConnectionCache() class is prepared for working with concurrent connections."""
-        self._connection = None
+        self._connection: Optional[cx_Oracle.Connection] = None
         self._cache = ConnectionCache()
 
-    def connect_to_oracle(self, dbname, dbusername, dbpassword, alias=None):
+    @property
+    def connection(self) -> cx_Oracle.Connection:
+        """Get current connection to Oracle database.
+
+        *Raises:*\n
+            RuntimeError: if there isn't any open connection.
+
+        *Returns:*\n
+            Current connection to the database.
+        """
+        if self._connection is None:
+            raise RuntimeError('There is no open connection to Oracle database.')
+        return self._connection
+
+    def make_dsn(self, host: str, port: str, sid: str, service_name: str = '') -> str:
+        """
+        Build dsn string for use in connection.
+
+        *Args:*\n
+            host - database host;\n
+            port - database port;\n
+            sid - database sid;\n
+            service_name - database service name;\n
+
+        *Returns:*\n
+            Returns dsn string.
+        """
+        return cx_Oracle.makedsn(host=host, port=port, sid=sid, service_name=service_name)
+
+    def connect_to_oracle(self, dbname: str, dbusername: str, dbpassword: str = None, alias: str = None) -> int:
         """
         Connection to Oracle DB.
 
@@ -48,15 +82,14 @@ class OracleDB(object):
         """
 
         try:
-            logger.debug(
-                'Connecting using : dbname=%s, dbusername=%s, dbpassword=%s ' % (dbname, dbusername, dbpassword))
-            connection_string = '%s/%s@%s' % (dbusername, dbpassword, dbname)
+            logger.debug(f'Connecting using : dbname={dbname}, dbusername={dbusername}, dbpassword={dbpassword}')
+            connection_string = f'{dbusername}/{dbpassword}@{dbname}'
             self._connection = cx_Oracle.connect(connection_string)
-            return self._cache.register(self._connection, alias)
+            return self._cache.register(self.connection, alias)
         except cx_Oracle.DatabaseError as err:
             raise Exception("Logon to oracle  Error:", str(err))
 
-    def disconnect_from_oracle(self):
+    def disconnect_from_oracle(self) -> None:
         """
         Close active Oracle connection.
 
@@ -65,10 +98,10 @@ class OracleDB(object):
             | Disconnect From Oracle |
         """
 
-        self._connection.close()
+        self.connection.close()
         self._cache.empty_cache()
 
-    def close_all_oracle_connections(self):
+    def close_all_oracle_connections(self) -> None:
         """
         Close all Oracle connections that were opened.
         You should not use [#Disconnect From Oracle|Disconnect From Oracle] and [#Close All Oracle Connections|Close All Oracle Connections]
@@ -88,7 +121,7 @@ class OracleDB(object):
 
         self._connection = self._cache.close_all()
 
-    def switch_oracle_connection(self, index_or_alias):
+    def switch_oracle_connection(self, index_or_alias: Union[int, str]) -> int:
         """
         Switch between existing Oracle connections using their connection IDs or aliases.
         The connection ID is obtained on creating connection.
@@ -134,7 +167,23 @@ class OracleDB(object):
         self._connection = self._cache.switch(index_or_alias)
         return old_index
 
-    def _execute_sql(self, cursor, statement, params):
+    @staticmethod
+    def wrap_into_html_details(statement: str, summary: str) -> str:
+        """Format statement for html logging.
+
+        *Args:*\n
+            _statement_: statement to log.
+            _summary_: summary for details tag.
+
+        *Returns:*\n
+            Formatted statement.
+        """
+        statement = sqlparse.format(statement, reindent=True, indent_width=4, keyword_case='upper')
+        statement_html = escape(statement)
+        data = f'<details><summary>{summary}</summary><p>{statement_html}</p></details>'
+        return data
+
+    def _execute_sql(self, cursor: cx_Oracle.Cursor, statement: str, params: Dict[str, Any]) -> cx_Oracle.Cursor:
         """ Execute SQL query on Oracle DB using active connection.
 
         *Args*:\n
@@ -146,12 +195,34 @@ class OracleDB(object):
             Query results.
         """
         statement_with_params = self._replace_parameters_in_statement(statement, params)
-        logger.info(statement_with_params, html=True)
+        _connection_info = '@'.join((cursor.connection.username, cursor.connection.dsn))
+        data = self.wrap_into_html_details(statement=statement_with_params,
+                                           summary=f'Executed PL/SQL statement on {_connection_info}')
+        logger.info(data, html=True)
         cursor.prepare(statement)
         self.last_executed_statement = self._replace_parameters_in_statement(statement, params)
-        return cursor.execute(None, params)
+        self.last_used_connection_index = self._cache.current_index
+        cursor.execute(None, params)
 
-    def _replace_parameters_in_statement(self, statement, params):
+    @staticmethod
+    def _get_timeout_from_execution_context() -> float:
+        """Get timeout from Robot Framework execution context.
+
+        Returns:
+            Current timeout value in seconds or None if timeout is not set.
+        """
+        timeouts = {}
+        default_timeout = OracleDB.DEFAULT_TIMEOUT
+        for timeout in EXECUTION_CONTEXTS.current.timeouts:
+            if timeout.active:
+                timeouts[timeout.type] = timeout.time_left()
+
+        if timeouts.get(KeywordTimeout.type, None):
+            return timeouts[KeywordTimeout.type]
+        test_timeout = timeouts.get(TestTimeout.type, None)
+        return test_timeout if test_timeout and test_timeout < default_timeout else default_timeout
+
+    def _replace_parameters_in_statement(self, statement: str, params: Dict[str, Any]) -> str:
         """Update SQL query parameters, if any exist, with their values for logging purposes.
 
         *Args*:\n
@@ -164,24 +235,26 @@ class OracleDB(object):
         params_keys = sorted(params.keys(), reverse=True)
         for key in params_keys:
             if isinstance(params[key], (int, float)):
-                statement = statement.replace(':{}'.format(key), str(params[key]))
+                statement = statement.replace(f':{key}', str(params[key]))
+            elif params[key] is None:
+                statement = statement.replace(f':{key}', 'NULL')
             else:
-                statement = statement.replace(':{}'.format(key), "'{}'".format(params[key]))
+                statement = statement.replace(f':{key}', f"'{params[key]}'")
         return statement
 
-    def execute_plsql_block(self, plsqlstatement, **params):
+    def execute_plsql_block(self, plsqlstatement: str, **params: Any) -> None:
         """
-        PL\SQL block execution.
+        PL/SQL block execution.
 
         *Args:*\n
-            _plsqlstatement_ - PL\SQL block;\n
-            _params_ - PL\SQL block parameters;\n
+            _plsqlstatement_ - PL/SQL block;\n
+            _params_ - PL/SQL block parameters;\n
 
         *Raises:*\n
             PLSQL Error: Error message encoded according to DB where the code was run
 
         *Returns:*\n
-            PL\SQL block execution result.
+            PL/SQL block execution result.
 
         *Example:*\n
             | *Settings* | *Value* |
@@ -216,23 +289,21 @@ class OracleDB(object):
             =>\n
             DatabaseError: ORA-20001: This is a custom error
         """
+        cursor = self.connection.cursor()
+        with sql_timeout(timeout=self._get_timeout_from_execution_context(), connection=cursor.connection):
+            try:
+                self._execute_sql(cursor, plsqlstatement, params)
+                self.connection.commit()
+            finally:
+                self.connection.rollback()
 
-        cursor = None
-        try:
-            cursor = self._connection.cursor()
-            self._execute_sql(cursor, plsqlstatement, params)
-            self._connection.commit()
-        finally:
-            if cursor:
-                self._connection.rollback()
-
-    def execute_plsql_block_with_dbms_output(self, plsqlstatement, **params):
+    def execute_plsql_block_with_dbms_output(self, plsqlstatement: str, **params: Any) -> List[str]:
         """
-        Execute PL\SQL block with dbms_output().
+        Execute PL/SQL block with dbms_output().
 
         *Args:*\n
-            _plsqlstatement_ - PL\SQL block;\n
-            _params_ - PL\SQL block parameters;\n
+            _plsqlstatement_ - PL/SQL block;\n
+            _params_ - PL/SQL block parameters;\n
 
         *Raises:*\n
             PLSQL Error: Error message encoded according to DB where the code was run.
@@ -279,33 +350,31 @@ class OracleDB(object):
             | @{dbms} | text 5, e-mail text |
             | | string 2 |
         """
-
-        cursor = None
         dbms_output = []
-        try:
-            cursor = self._connection.cursor()
-            cursor.callproc("dbms_output.enable")
-            self._execute_sql(cursor, plsqlstatement, params)
-            self._connection.commit()
-            statusvar = cursor.var(cx_Oracle.NUMBER)
-            linevar = cursor.var(cx_Oracle.STRING)
-            while True:
-                cursor.callproc("dbms_output.get_line", (linevar, statusvar))
-                if statusvar.getvalue() != 0:
-                    break
-                dbms_output.append(linevar.getvalue())
-            return dbms_output
-        finally:
-            if cursor:
-                self._connection.rollback()
+        cursor = self.connection.cursor()
+        with sql_timeout(timeout=self._get_timeout_from_execution_context(), connection=cursor.connection):
+            try:
+                cursor.callproc("dbms_output.enable")
+                self._execute_sql(cursor, plsqlstatement, params)
+                self.connection.commit()
+                statusvar = cursor.var(cx_Oracle.NUMBER)
+                linevar = cursor.var(cx_Oracle.STRING)
+                while True:
+                    cursor.callproc("dbms_output.get_line", (linevar, statusvar))
+                    if statusvar.getvalue() != 0:
+                        break
+                    dbms_output.append(linevar.getvalue())
+                return dbms_output
+            finally:
+                self.connection.rollback()
 
-    def execute_plsql_script(self, file_path, **params):
+    def execute_plsql_script(self, file_path: str, **params: Any) -> None:
         """
-         Execution of PL\SQL code from file.
+         Execution of PL/SQL code from file.
 
         *Args:*\n
-            _file_path_ - path to PL\SQL script file;\n
-            _params_ - PL\SQL code parameters;\n
+            _file_path_ - path to PL/SQL script file;\n
+            _params_ - PL/SQL code parameters;\n
 
         *Raises:*\n
             PLSQL Error: Error message encoded according to DB where the code was run.
@@ -319,19 +388,19 @@ class OracleDB(object):
             data = script.read()
             self.execute_plsql_block(data, **params)
 
-    def execute_sql_string(self, plsqlstatement, **params):
+    def execute_sql_string(self, plsqlstatement: str, **params: Any) -> List[Tuple[Any, ...]]:
         """
-        Execute PL\SQL string.
+        Execute PL/SQL string.
 
         *Args:*\n
-            _plsqlstatement_ - PL\SQL string;\n
-            _params_ - PL\SQL string parameters;\n
+            _plsqlstatement_ - PL/SQL string;\n
+            _params_ - PL/SQL string parameters;\n
 
         *Raises:*\n
             PLSQL Error: Error message encoded according to DB where the code was run.
 
         *Returns:*\n
-            PL\SQL string execution result.
+            PL/SQL string execution result.
 
         *Example:*\n
             | @{query}= | Execute Sql String | select sysdate, sysdate+1 from dual |
@@ -342,24 +411,22 @@ class OracleDB(object):
             | Set Test Variable  |  ${sys_date}  |  ${query[0][0]} |
             | Set Test Variable  |  ${next_date}  |  ${query[0][1]} |
         """
+        cursor = self.connection.cursor()
+        with sql_timeout(timeout=self._get_timeout_from_execution_context(), connection=cursor.connection):
+            try:
+                self._execute_sql(cursor, plsqlstatement, params)
+                query_result = cursor.fetchall()
+                self.result_logger(query_result)
+                return query_result
+            finally:
+                self.connection.rollback()
 
-        cursor = None
-        try:
-            cursor = self._connection.cursor()
-            self._execute_sql(cursor, plsqlstatement, params)
-            query_result = cursor.fetchall()
-            self.result_logger(query_result)
-            return query_result
-        finally:
-            if cursor:
-                self._connection.rollback()
-
-    def execute_sql_string_mapped(self, sql_statement, **params):
+    def execute_sql_string_mapped(self, sql_statement: str, **params: Any) -> List[Dict[str, Any]]:
         """SQL query execution where each result row is mapped as a dict with column names as keys.
 
         *Args:*\n
-            _sql_statement_ - PL\SQL string;\n
-            _params_ - PL\SQL string parameters;\n
+            _sql_statement_ - PL/SQL string;\n
+            _params_ - PL/SQL string parameters;\n
 
         *Returns:*\n
             A list of dictionaries where column names are mapped as keys.
@@ -373,44 +440,42 @@ class OracleDB(object):
             | Set Test Variable  |  ${sys_date}  |  ${query[0][sysdate]} |
             | Set Test Variable  |  ${next_date}  |  ${query[0][sysdate1]} |
         """
-        cursor = None
-        try:
-            cursor = self._connection.cursor()
-            self._execute_sql(cursor, sql_statement, params)
-            col_name = tuple(i[0] for i in cursor.description)
-            query_result = [dict(zip(col_name, row)) for row in cursor]
-            self.result_logger(query_result)
-            return query_result
-        finally:
-            if cursor:
-                self._connection.rollback()
+        cursor = self.connection.cursor()
+        with sql_timeout(timeout=self._get_timeout_from_execution_context(), connection=cursor.connection):
+            try:
+                self._execute_sql(cursor, sql_statement, params)
+                col_name = tuple(i[0] for i in cursor.description)
+                query_result = [dict(zip(col_name, row)) for row in cursor]
+                self.result_logger(query_result)
+                return query_result
+            finally:
+                self.connection.rollback()
 
-    def execute_sql_string_generator(self, sql_statement, **params):
+    def execute_sql_string_generator(self, sql_statement: str, **params: Any) -> Iterable[Dict[str, Any]]:
         """Generator that yields each result row mapped as a dict with column names as keys.\n
         Intended for use mainly in code for other keywords.
         *If used, the generator must be explicitly closed before closing DB connection*
 
         *Args:*\n
-            _sql_statement_ - PL\SQL string;\n
-            _params_ - PL\SQL string parameters;\n
+            _sql_statement_ - PL/SQL string;\n
+            _params_ - PL/SQL string parameters;\n
 
         Yields:*\n
             results dict.
         """
-        cursor = None
         self.last_executed_statement = sql_statement
         self.last_executed_statement_params = params
-        try:
-            cursor = self._connection.cursor()
-            self._execute_sql(cursor, sql_statement, params)
-            col_name = tuple(i[0] for i in cursor.description)
-            for row in cursor:
-                yield dict(zip(col_name, row))
-        finally:
-            if cursor:
-                self._connection.rollback()
+        cursor = self.connection.cursor()
+        with sql_timeout(timeout=self._get_timeout_from_execution_context(), connection=cursor.connection):
+            try:
+                self._execute_sql(cursor, sql_statement, params)
+                col_name = tuple(i[0] for i in cursor.description)
+                for row in cursor:
+                    yield dict(zip(col_name, row))
+            finally:
+                self.connection.rollback()
 
-    def result_logger(self, query_result, result_amount=10):
+    def result_logger(self, query_result: List[Any], result_amount: int = 10) -> None:
         """Log first n rows from the query results
 
         *Args:*\n
@@ -419,4 +484,61 @@ class OracleDB(object):
         """
         if len(query_result) > result_amount > 0:
             query_result = query_result[:result_amount]
-        logger.info(query_result, html=True)
+        logged_result = self.wrap_into_html_details(str(query_result), "SQL Query Result")
+        logger.info(logged_result, html=True)
+
+    @contextmanager
+    def use_connection(self, conn_index: Union[int, str]) -> Iterator[None]:
+        """Context manager for switching connection.
+
+        Args:
+            conn_index: Connection index or alias to switch.
+
+        Yields: generator.
+        """
+        _old_con_index = self.switch_oracle_connection(conn_index)
+        yield
+        self.switch_oracle_connection(_old_con_index)
+
+
+class sql_timeout(object):
+    """Context manager to set SQL execution timeout."""
+
+    def __init__(self, timeout: Optional[float], connection: cx_Oracle.Connection) -> None:
+        """Initialisation.
+
+        Args:
+            timeout: timeout in seconds.
+            connection: Oracle database connection.
+        """
+        self.timer = Timer(timeout, connection.cancel) if timeout else None
+        self.builtin = BuiltIn()
+
+    def __enter__(self) -> 'sql_timeout':
+        """Enter the sql_timeout context manager.
+
+        Returns:
+            Instance of sql_timeout context manager.
+        """
+        if self.timer:
+            self.timer.start()
+            logger.debug(f'SQL execution started with timeout {self.timer.interval} seconds')  # type: ignore
+        return self
+
+    def __exit__(self, exc_type: Optional[Type[BaseException]], exc_val: Optional[BaseException],
+                 exc_tb: Optional[TracebackType]) -> None:
+        """Exit the sql_timeout context manager.
+        The parameters describe the exception that caused the context to be exited.
+        If the context was exited without an exception, all three arguments will be None.
+
+        Args:
+            exc_type: exception type;
+            exc_val: exception value;
+            exc_tb: exception traceback.
+        """
+        if self.timer:
+            if self.timer.is_alive():
+                self.timer.cancel()
+            else:
+                logger.debug(f'SQL execution timeout {self.timer.interval} seconds exceeded.')  # type: ignore
+                self.builtin.fail(msg=f'Timeout is ended and equal as {self.timer.interval}.')
