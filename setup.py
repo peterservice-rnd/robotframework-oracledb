@@ -18,7 +18,7 @@ with open(path.join(here, 'requirements.txt')) as f:
 
 setup(
     name='robotframework-oracledb',
-    version='2.0.1',
+    version='2.0.2',
     description='Robot Framework library for working with Oracle Database.',
     long_description=long_description,
     url='https://github.com/peterservice-rnd/robotframework-oracledb',
