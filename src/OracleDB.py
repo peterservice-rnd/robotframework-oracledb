@@ -220,7 +220,7 @@ class OracleDB(object):
         if timeouts.get(KeywordTimeout.type, None):
             return timeouts[KeywordTimeout.type]
         test_timeout = timeouts.get(TestTimeout.type, None)
-        return test_timeout if test_timeout and test_timeout < default_timeout else default_timeout
+        return test_timeout if test_timeout and test_timeout else default_timeout
 
     def _replace_parameters_in_statement(self, statement: str, params: Dict[str, Any]) -> str:
         """Update SQL query parameters, if any exist, with their values for logging purposes.
